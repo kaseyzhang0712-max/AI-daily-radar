@@ -2,7 +2,7 @@ name: AI Daily Radar
 
 on:
   schedule:
-    - cron: '0 1 * * *'   # 北京时间 9:00
+    - cron: '0 1 * * *'
   workflow_dispatch:
 
 jobs:
@@ -17,7 +17,7 @@ jobs:
           python-version: '3.10'
 
       - name: Install dependencies
-        run: pip install requests python-dateutil
+        run: pip install requests
 
       - name: Run AI Daily Radar
         env:
@@ -27,4 +27,6 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: gpt-4o-mini
         run: python ai_daily_radar_email.py
