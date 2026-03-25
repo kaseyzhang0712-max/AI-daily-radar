@@ -1,7 +1,9 @@
 import html
+import json
 import os
 import smtplib
 import ssl
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
@@ -10,10 +12,14 @@ from email.mime.text import MIMEText
 import requests
 
 HF_API = "https://huggingface.co/api/models"
+PH_TOKEN_URL = "https://api.producthunt.com/v2/oauth/token"
+PH_GRAPHQL_URL = "https://api.producthunt.com/v2/api/graphql"
+
+_ph_token_cache = {"access_token": None, "expires_at": 0}
 
 
 # =====================
-# 基础能力
+# 基础抓取
 # =====================
 def fetch_models():
     params = {"limit": 100, "sort": "lastModified", "direction": -1}
@@ -31,7 +37,120 @@ def fetch_news():
 
 
 # =====================
-# 模型逻辑
+# Product Hunt 真实接口
+# =====================
+def get_product_hunt_token():
+    global _ph_token_cache
+
+    now = time.time()
+    if _ph_token_cache["access_token"] and now < _ph_token_cache["expires_at"] - 60:
+        return _ph_token_cache["access_token"]
+
+    client_id = os.environ.get("PRODUCT_HUNT_CLIENT_ID")
+    client_secret = os.environ.get("PRODUCT_HUNT_CLIENT_SECRET")
+
+    if not client_id or not client_secret:
+        raise RuntimeError("Missing PRODUCT_HUNT_CLIENT_ID or PRODUCT_HUNT_CLIENT_SECRET")
+
+    payload = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "grant_type": "client_credentials",
+    }
+
+    resp = requests.post(PH_TOKEN_URL, json=payload, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    access_token = data["access_token"]
+    expires_in = data.get("expires_in", 3600)
+
+    _ph_token_cache = {
+        "access_token": access_token,
+        "expires_at": now + expires_in,
+    }
+    return access_token
+
+
+def fetch_product_hunt_products():
+    token = get_product_hunt_token()
+
+    query = """
+    query GetPosts {
+      posts(first: 10, order: VOTES) {
+        edges {
+          node {
+            id
+            name
+            tagline
+            description
+            votesCount
+            url
+            website
+            createdAt
+            topics(first: 5) {
+              edges {
+                node {
+                  name
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+    resp = requests.post(
+        PH_GRAPHQL_URL,
+        headers=headers,
+        json={"query": query},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    if "errors" in data:
+        raise RuntimeError(f"Product Hunt GraphQL error: {data['errors']}")
+
+    edges = data["data"]["posts"]["edges"]
+    products = []
+
+    for edge in edges:
+        node = edge["node"]
+        topics = [t["node"]["name"] for t in node.get("topics", {}).get("edges", [])]
+
+        products.append(
+            {
+                "name": node["name"],
+                "tagline": node.get("tagline") or "",
+                "description": node.get("description") or "",
+                "votes": node.get("votesCount", 0),
+                "url": node.get("url") or node.get("website") or "https://www.producthunt.com/",
+                "topics": topics,
+                "created_at": node.get("createdAt"),
+            }
+        )
+
+    return products
+
+
+def safe_fetch_product_hunt_products():
+    try:
+        return fetch_product_hunt_products()
+    except Exception as e:
+        print(f"Product Hunt fetch failed: {e}")
+        return []
+
+
+# =====================
+# Hugging Face 模型逻辑
 # =====================
 def is_good_model(m):
     downloads = m.get("downloads", 0) or 0
@@ -142,9 +261,108 @@ def dedupe_news(items):
 
 
 # =====================
-# LLM 洞察
+# Product Hunt 分析
 # =====================
-def generate_insight_with_openai(models, news):
+def fallback_product_analysis(product):
+    name = product["name"].lower()
+    tagline = product["tagline"].lower()
+    desc = product.get("description", "").lower()
+    topics = " ".join(product.get("topics", [])).lower()
+    text = f"{name} {tagline} {desc} {topics}"
+
+    if "agent" in text:
+        return {
+            "users": "开发者、自动化场景用户、AI 应用团队",
+            "value": "帮助用户搭建或管理 AI Agent 工作流",
+            "why_hot": "Agent 仍是当前最受关注的 AI 产品方向之一，兼具想象空间和实际落地场景",
+            "category": "AI Agent / Workflow",
+        }
+    if "code" in text or "coder" in text:
+        return {
+            "users": "开发者、独立开发者、技术团队",
+            "value": "提升代码生成与开发效率",
+            "why_hot": "AI coding 是当前大模型最成熟、最容易形成留存的应用场景之一",
+            "category": "AI Coding Tool",
+        }
+    if "monitor" in text or "analytics" in text or "debug" in text:
+        return {
+            "users": "AI 产品团队、Agent 开发者",
+            "value": "解决 AI Agent 上线后的监控、调试和评估问题",
+            "why_hot": "随着 Agent 增多，配套基础设施需求同步增长",
+            "category": "AI Infra / Dev Tool",
+        }
+
+    return {
+        "users": "广义 AI 工具用户",
+        "value": "通过 AI 提升某一具体任务的效率",
+        "why_hot": "AI 工具类产品仍在快速迭代，用户愿意尝试能立即带来效率提升的产品",
+        "category": "AI Tool",
+    }
+
+
+def analyze_product_with_openai(product):
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return None
+
+    model_name = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+    topics_text = ", ".join(product.get("topics", []))
+
+    prompt = f"""
+请分析这个 Product Hunt 上的 AI 产品，并输出 JSON：
+
+产品名：{product['name']}
+Tagline：{product['tagline']}
+Description：{product.get('description', '')}
+Topics：{topics_text}
+Votes：{product['votes']}
+
+请输出字段：
+users: 目标用户
+value: 核心价值
+why_hot: 为什么会火
+category: 产品类型（如 AI Agent / AI Coding / AI Infra / AI Tool）
+
+只输出 JSON，不要加解释。
+""".strip()
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": "你是一个专业、简洁的 AI 产品分析助手。"},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.3,
+    }
+
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"].strip()
+        return json.loads(content)
+    except Exception:
+        return None
+
+
+def analyze_product(product):
+    return analyze_product_with_openai(product) or fallback_product_analysis(product)
+
+
+# =====================
+# 洞察与机会点
+# =====================
+def generate_insight_with_openai(models, products, news):
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         return None
@@ -157,12 +375,20 @@ def generate_insight_with_openai(models, news):
             f"- {m['id']} | likes={m.get('likes', 0)} | downloads={m.get('downloads', 0)} | explain={explain_model(m)}"
         )
 
+    product_lines = []
+    for p in products[:5]:
+        product_lines.append(
+            f"- {p['name']} | tagline={p['tagline']} | votes={p['votes']} | category={p['analysis']['category']}"
+        )
+
     news_lines = []
     for n in news[:5]:
-        news_lines.append(f"- {n['title']} | summary={n['summary']} | why={n['why_it_matters']}")
+        news_lines.append(
+            f"- {n['title']} | summary={n['summary']} | why={n['why_it_matters']}"
+        )
 
     prompt = f"""
-你是一个AI行业分析师。请基于下面的信息，生成1句中文“今日洞察”。
+你是一个AI行业分析师。请基于下面三类信息，生成1句中文“今日洞察”。
 
 要求：
 1. 只输出一句话，不要分点
@@ -172,6 +398,9 @@ def generate_insight_with_openai(models, news):
 
 模型信息：
 {chr(10).join(model_lines)}
+
+产品信息：
+{chr(10).join(product_lines)}
 
 新闻信息：
 {chr(10).join(news_lines)}
@@ -205,14 +434,80 @@ def generate_insight_with_openai(models, news):
         return None
 
 
-def fallback_insight(news):
-    if any("agent" in n["title"].lower() for n in news):
-        return "AI 正在从模型能力竞争，逐步转向 Agent 和应用层竞争。"
-    if any("coder" in n["title"].lower() or "code" in n["title"].lower() for n in news):
-        return "AI coding 仍是最清晰的落地方向之一，模型竞争正在快速传导到应用层。"
+def fallback_insight(products, news):
+    categories = [p["analysis"]["category"] for p in products]
+
+    if any("Agent" in c for c in categories):
+        return "AI 正在从模型能力竞争，进一步转向 Agent 和工作流产品竞争。"
+    if any("Coding" in c for c in categories):
+        return "AI coding 依然是最清晰的商业化落地方向之一，产品竞争持续升温。"
     if any("sora" in n["title"].lower() for n in news):
-        return "视频生成赛道正在从“展示能力”走向“产品化与合规”阶段。"
-    return "AI 行业仍在快速演进，模型、产品与产业侧变化正在同时发生。"
+        return "视频生成赛道正在从技术展示走向产品化与风险治理阶段。"
+    return "AI 行业正在同时推进模型、产品和应用层创新，竞争焦点逐步上移。"
+
+
+def generate_product_opportunity(products, news):
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        categories = [p["analysis"]["category"] for p in products]
+        if any("Agent" in c for c in categories):
+            return "可以考虑做一个面向垂直场景的 AI Agent 监控与评估工具。"
+        if any("Coding" in c for c in categories):
+            return "可以考虑做一个面向非技术用户的 AI coding workflow 产品。"
+        return "可以考虑做一个帮助用户理解 AI 产品趋势和机会点的洞察工具。"
+
+    model_name = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+
+    product_lines = []
+    for p in products[:5]:
+        product_lines.append(
+            f"- {p['name']} | {p['tagline']} | category={p['analysis']['category']} | why_hot={p['analysis']['why_hot']}"
+        )
+    news_lines = []
+    for n in news[:5]:
+        news_lines.append(f"- {n['title']} | {n['why_it_matters']}")
+
+    prompt = f"""
+你是一个AI产品经理。请基于今天的 Product Hunt AI 产品和 AI 新闻，输出 1 句话“今日产品机会”。
+
+要求：
+1. 只输出一句中文
+2. 30-50字
+3. 要像真实产品机会，而不是空话
+
+Product Hunt:
+{chr(10).join(product_lines)}
+
+News:
+{chr(10).join(news_lines)}
+""".strip()
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": "你是一个有产品感的 AI 产品经理。"},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.6,
+    }
+
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception:
+        return "可以考虑做一个帮助用户理解 AI 产品趋势和机会点的洞察工具。"
 
 
 # =====================
@@ -221,11 +516,14 @@ def fallback_insight(news):
 def build_data():
     models_raw = fetch_models()
     news_raw = fetch_news()
+    products_raw = safe_fetch_product_hunt_products()
 
+    # 模型
     models = [m for m in models_raw if is_good_model(m)]
     models.sort(key=model_score, reverse=True)
     models = models[:5]
 
+    # 新闻
     news = []
     for item in news_raw:
         title = item.findtext("title") or ""
@@ -233,32 +531,48 @@ def build_data():
         source = item.findtext("source") or ""
         summary, why_it_matters = summarize_news(title)
 
-        news.append({
-            "title": title,
-            "link": link,
-            "source": source,
-            "summary": summary,
-            "why_it_matters": why_it_matters,
-        })
+        news.append(
+            {
+                "title": title,
+                "link": link,
+                "source": source,
+                "summary": summary,
+                "why_it_matters": why_it_matters,
+            }
+        )
 
     news = dedupe_news(news)[:5]
 
-    insight = generate_insight_with_openai(models, news) or fallback_insight(news)
+    # Product Hunt
+    products = []
+    for p in products_raw[:5]:
+        products.append(
+            {
+                **p,
+                "analysis": analyze_product(p),
+            }
+        )
+
+    # 洞察与机会点
+    insight = generate_insight_with_openai(models, products, news) or fallback_insight(products, news)
+    product_opportunity = generate_product_opportunity(products, news)
 
     return {
         "date": datetime.now().strftime("%Y-%m-%d"),
         "models": models,
         "news": news,
+        "products": products,
         "insight": insight,
+        "product_opportunity": product_opportunity,
     }
 
 
 # =====================
-# 文本版邮件
+# 渲染
 # =====================
 def render_plain(data):
     lines = []
-    lines.append(f"AI Daily Radar | {data['date']}")
+    lines.append(f"AI Intelligence Radar | {data['date']}")
     lines.append("")
 
     lines.append("🔥 今日值得关注模型")
@@ -267,6 +581,22 @@ def render_plain(data):
         lines.append(f"  {explain_model(m)}")
         lines.append(f"  likes={m.get('likes', 0)} | downloads={m.get('downloads', 0)}")
     lines.append("")
+
+    lines.append("🚀 Product Hunt 热门 AI 产品")
+    if data["products"]:
+        for p in data["products"]:
+            a = p["analysis"]
+            lines.append(f"- {p['name']} ({p['votes']} votes)")
+            lines.append(f"  tagline: {p['tagline']}")
+            lines.append(f"  用户: {a['users']}")
+            lines.append(f"  价值: {a['value']}")
+            lines.append(f"  为什么火: {a['why_hot']}")
+            lines.append(f"  类型: {a['category']}")
+            lines.append(f"  链接: {p['url']}")
+            lines.append("")
+    else:
+        lines.append("- 今天没有抓到 Product Hunt 数据")
+        lines.append("")
 
     lines.append("📰 AI 热点新闻")
     for i, n in enumerate(data["news"], start=1):
@@ -279,13 +609,13 @@ def render_plain(data):
 
     lines.append("🧠 今日洞察")
     lines.append(data["insight"])
+    lines.append("")
+    lines.append("💡 今日产品机会")
+    lines.append(data["product_opportunity"])
 
     return "\n".join(lines)
 
 
-# =====================
-# HTML 邮件
-# =====================
 def esc(text):
     return html.escape(text or "")
 
@@ -298,6 +628,23 @@ def render_html(data):
           <div style="font-size:15px;font-weight:700;color:#111827;word-break:break-all;">{esc(m['id'])}</div>
           <div style="font-size:13px;color:#4b5563;margin-top:6px;line-height:1.6;">{esc(explain_model(m))}</div>
           <div style="font-size:12px;color:#6b7280;margin-top:8px;">👍 likes={m.get('likes', 0)} &nbsp;&nbsp; ⬇ downloads={m.get('downloads', 0)}</div>
+        </div>
+        """)
+
+    product_cards = []
+    for p in data["products"]:
+        a = p["analysis"]
+        product_cards.append(f"""
+        <div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:12px;padding:14px 16px;margin-bottom:12px;">
+          <div style="font-size:15px;font-weight:700;color:#111827;">{esc(p['name'])}</div>
+          <div style="font-size:13px;color:#4b5563;margin-top:6px;line-height:1.6;">{esc(p['tagline'])}</div>
+          <div style="font-size:12px;color:#6b7280;margin-top:8px;">🔥 {p['votes']} votes &nbsp;&nbsp; | &nbsp;&nbsp; {esc(a['category'])}</div>
+          <div style="font-size:13px;color:#374151;margin-top:10px;line-height:1.7;"><strong>用户：</strong>{esc(a['users'])}</div>
+          <div style="font-size:13px;color:#374151;margin-top:6px;line-height:1.7;"><strong>价值：</strong>{esc(a['value'])}</div>
+          <div style="font-size:13px;color:#374151;margin-top:6px;line-height:1.7;"><strong>为什么火：</strong>{esc(a['why_hot'])}</div>
+          <div style="margin-top:10px;">
+            <a href="{esc(p['url'])}" style="font-size:13px;color:#2563eb;text-decoration:none;">查看 Product Hunt</a>
+          </div>
         </div>
         """)
 
@@ -315,12 +662,12 @@ def render_html(data):
         </div>
         """)
 
-    html_content = f"""
+    return f"""
     <html>
       <body style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif;">
         <div style="max-width:760px;margin:0 auto;padding:24px 16px;">
           <div style="background:#111827;color:#ffffff;border-radius:16px;padding:24px 24px 20px 24px;">
-            <div style="font-size:28px;font-weight:800;">AI Daily Radar</div>
+            <div style="font-size:28px;font-weight:800;">AI Intelligence Radar</div>
             <div style="font-size:14px;color:#d1d5db;margin-top:8px;">{esc(data['date'])}</div>
           </div>
 
@@ -329,9 +676,19 @@ def render_html(data):
             <div style="font-size:15px;color:#7c2d12;line-height:1.8;margin-top:10px;">{esc(data['insight'])}</div>
           </div>
 
+          <div style="background:#ecfeff;border:1px solid #a5f3fc;border-radius:16px;padding:18px 20px;margin-top:16px;">
+            <div style="font-size:18px;font-weight:800;color:#155e75;">💡 今日产品机会</div>
+            <div style="font-size:15px;color:#164e63;line-height:1.8;margin-top:10px;">{esc(data['product_opportunity'])}</div>
+          </div>
+
           <div style="margin-top:20px;">
             <div style="font-size:20px;font-weight:800;color:#111827;margin-bottom:12px;">🔥 今日值得关注模型</div>
             {''.join(model_cards) if model_cards else '<div style="color:#6b7280;">今天没有筛到高质量模型</div>'}
+          </div>
+
+          <div style="margin-top:20px;">
+            <div style="font-size:20px;font-weight:800;color:#111827;margin-bottom:12px;">🚀 Product Hunt 热门 AI 产品</div>
+            {''.join(product_cards) if product_cards else '<div style="color:#6b7280;">今天没有抓到 Product Hunt 数据</div>'}
           </div>
 
           <div style="margin-top:20px;">
@@ -340,13 +697,12 @@ def render_html(data):
           </div>
 
           <div style="font-size:12px;color:#9ca3af;text-align:center;margin-top:28px;">
-            Generated by AI Daily Radar
+            Generated by AI Intelligence Radar
           </div>
         </div>
       </body>
     </html>
     """
-    return html_content
 
 
 # =====================
@@ -360,7 +716,7 @@ def send_email(data):
     html_content = render_html(data)
 
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"AI Daily Radar | {data['date']}"
+    msg["Subject"] = f"AI Intelligence Radar | {data['date']}"
     msg["From"] = email_from
     msg["To"] = email_to
 
