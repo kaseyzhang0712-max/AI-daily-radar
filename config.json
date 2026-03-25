@@ -1,4 +1,9 @@
 {
-  "interests": ["agent", "llm", "coding"],
-  "news_limit": 3
+  "user_name": "Meng",
+  "interests": ["agent", "llm", "coding", "finance ai"],
+  "new_model_limit": 5,
+  "hot_model_limit": 3,
+  "news_limit": 5,
+  "news_query": "artificial intelligence OR AI OR OpenAI OR Anthropic OR Google DeepMind OR Hugging Face OR AI agent OR AI coding",
+  "global_summary": true
 }
